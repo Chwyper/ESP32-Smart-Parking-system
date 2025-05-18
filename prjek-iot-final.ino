@@ -8,9 +8,9 @@
 #include <ArduinoJson.h>
 
 // WiFi credentials
-const char* ssid = "NAMA_WIFI_KAMU";
-const char* password = "PASSWORD_WIFI_KAMU";
-const char* serverUrl = "https://smart-parking-app.vercel.app/api/gate/update"; // Ganti sesuai endpoint API kamu
+const char* ssid = "HOSTPOT ITENAS";
+const char* password = "";
+const char* serverUrl = "https:"; // Ganti sesuai endpoint API
 
 // RFID
 #define RST_PIN     22
