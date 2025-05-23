@@ -1,16 +1,6 @@
 #include <ESP32Servo.h>
 #include <SPI.h>
 #include <MFRC522.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-
-// WiFi credentials
-const char* ssid = "HOSTPOT ITENAS";
-const char* password = "";
-const char* serverUrl = "https:"; // Ganti sesuai endpoint API
 
 // RFID
 #define RST_PIN     22
@@ -19,19 +9,21 @@ const char* serverUrl = "https:"; // Ganti sesuai endpoint API
 // Servo
 #define SERVO_PIN   2
 #define TOUCH_PIN   14
+#define TOUCH_PIN2  27 
 
 // Ultrasonic
 #define TRIG_PIN        5
 #define ECHO_PIN        17
-#define TRIG_PIN_OUT    12
-#define ECHO_PIN_OUT    13
+#define TRIG_PIN_OUT   12
+#define ECHO_PIN_OUT   13
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 Servo myServo;
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Bisa juga 0x3F tergantung modul
 
 bool isOpen = false;
 unsigned long openTime = 0;
+
+// Untuk deteksi ultrasonik masuk
 bool ultrasonicDetected = false;
 unsigned long ultrasonicStartTime = 0;
 
@@ -44,49 +36,32 @@ void setup() {
   myServo.attach(SERVO_PIN);
   myServo.write(0); // posisi awal tertutup
 
-  Wire.begin(4, 15);
-  lcd.init();
-  lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("Sistem Parkir");
-  lcd.setCursor(0, 1);
-  lcd.print("Siap Digunakan");
-
   pinMode(TOUCH_PIN, INPUT);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(TRIG_PIN_OUT, OUTPUT);
   pinMode(ECHO_PIN_OUT, INPUT);
-
-  // Koneksi WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Menghubungkan WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi terhubung!");
 }
 
 void loop() {
   // ===== Touch Sensor =====
   if (digitalRead(TOUCH_PIN) == HIGH) {
-    Serial.println("Touch detected: Ready Car");
-    delay(200);
+    Serial.println("Touch detected: Slot 1 isi");
+    delay(200); // debounce
+  }
+
+  if (digitalRead(TOUCH_PIN2) == HIGH) {
+    Serial.println("Touch detected: Slot 2 isi");
+    delay(200); // debounce
   }
 
   // ===== RFID Deteksi =====
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     Serial.println("Kartu RFID terdeteksi!");
-    String uid = getUID();
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Kartu Terdeteksi");
-    lcd.setCursor(0, 1);
-    lcd.print(uid);
+    printUIDToSerial();
 
     if (!isOpen) {
-      bukaServo("rfid", uid);
+      bukaServo();
     }
 
     rfid.PICC_HaltA();
@@ -95,73 +70,53 @@ void loop() {
 
   // ===== Ultrasonik Masuk =====
   float distance = jarakmasuk();
-  if (distance >= 2.0 && distance <= 4.5) {
+  Serial.print("Jarak masuk: ");
+  Serial.println(distance);  // Debug distance
+  
+  if (distance >= 6.0 && distance <= 9.0) {
     if (!ultrasonicDetected) {
       ultrasonicDetected = true;
       ultrasonicStartTime = millis();
-    } else if ((millis() - ultrasonicStartTime >= 3000) && !isOpen) {
-      Serial.println("Deteksi masuk valid");
-      bukaServo("masuk", "");
+      Serial.println("Deteksi awal ultrasonik");
+    }
+    
+    // Cek jika sudah 3 detik berturut-turut
+    if ((millis() - ultrasonicStartTime >= 3000) && !isOpen) {
+      Serial.println("Deteksi masuk valid, membuka gerbang...");
+      bukaServo();
+      ultrasonicDetected = false;
     }
   } else {
     ultrasonicDetected = false;
+    Serial.println("Objek keluar jangkauan");
   }
 
   // ===== Ultrasonik Keluar =====
   float distance_out = jarakkeluar();
-  if (distance_out >= 2.0 && distance_out <= 4.5 && !isOpen) {
-    Serial.println("Mobil keluar");
-    bukaServo("keluar", "");
+  Serial.print("Jarak keluar: ");
+  Serial.println(distance_out);
+  
+  if (distance_out >= 2.0 &&  distance_out <= 4.5 && !isOpen) {
+    Serial.println("Mobil keluar, membuka gerbang...");
+    bukaServo();
   }
 
-  // ===== Tutup otomatis servo =====
+  // ===== Tutup otomatis servo setelah 10 detik =====
   if (isOpen && (millis() - openTime >= 10000)) {
     myServo.write(0);
     isOpen = false;
     Serial.println("Servo ditutup kembali");
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Gerbang tertutup");
   }
 
   delay(500);
 }
 
-// ===== Fungsi buka servo + kirim ke server =====
-void bukaServo(String triggerSource, String uid) {
-  myServo.write(90);
+// ===== Fungsi buka servo =====
+void bukaServo() {
+  myServo.write(90);  // Buka
   isOpen = true;
   openTime = millis();
   Serial.println("Servo terbuka");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Gerbang terbuka");
-
-  // Kirim status ke server
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(serverUrl);
-    http.addHeader("Content-Type", "application/json");
-
-    StaticJsonDocument<256> doc;
-    doc["gateId"] = "gate1";
-    doc["trigger"] = triggerSource;
-    doc["status"] = "open";
-    doc["uid"] = uid;
-
-    String jsonData;
-    serializeJson(doc, jsonData);
-    int httpCode = http.POST(jsonData);
-
-    if (httpCode > 0) {
-      String response = http.getString();
-      Serial.println("Server response: " + response);
-    } else {
-      Serial.println("Gagal kirim ke server: " + String(httpCode));
-    }
-
-    http.end();
-  }
 }
 
 // ===== Fungsi jarak masuk =====
@@ -172,7 +127,7 @@ float jarakmasuk() {
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30001);
   float distance = duration * 0.034 / 2;
   return distance;
 }
@@ -190,8 +145,8 @@ float jarakkeluar() {
   return distance_out;
 }
 
-// ===== Fungsi ambil UID =====
-String getUID() {
+// ===== Fungsi tampilkan UID ke Serial =====
+void printUIDToSerial() {
   String uidString = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
     uidString += (rfid.uid.uidByte[i] < 0x10 ? "0" : "");
@@ -199,7 +154,7 @@ String getUID() {
     if (i < rfid.uid.size - 1) uidString += ":";
   }
   uidString.toUpperCase();
+
   Serial.print("UID: ");
   Serial.println(uidString);
-  return uidString;
 }
