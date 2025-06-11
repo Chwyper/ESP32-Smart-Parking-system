@@ -10,9 +10,10 @@
 // WiFi credentials
 const char *ssid = "HOSTPOT ITENAS"; // Your WiFi SSID
 const char *password = "";           // Your WiFi Password (leave empty if open)
-// Firebase Realtime Database URL - target the 'gate_events' path and append .json
-// Each POST to this URL will create a new entry with a unique ID under 'gate_events'
-const char *serverUrl = "https://my-app-fak-default-rtdb.asia-southeast1.firebasedatabase.app/gate_events.json";
+// Firebase Realtime Database URL
+const char *firebaseHost = "my-app-fak-default-rtdb.asia-southeast1.firebasedatabase.app";
+const String firebaseGateEventsPath = "/gate_events.json"; // For POSTing new gate events
+const String firebaseParkingSlotsPath = "/parking_slots/"; // Base path for PUTting slot status, will append slotId.json
 
 // RFID
 #define RST_PIN 22
@@ -28,14 +29,21 @@ const char *serverUrl = "https://my-app-fak-default-rtdb.asia-southeast1.firebas
 #define TRIG_PIN_OUT 12 // Ultrasonic sensor for exit detection
 #define ECHO_PIN_OUT 13
 
+// Slot Sensors (TTP223) - 4 slots
+const int slotSensorPins[] = {18, 19, 23, 25}; // GPIO pins for TTP223 sensors
+const int numSlots = sizeof(slotSensorPins) / sizeof(slotSensorPins[0]);
+bool currentSlotStatus[numSlots];
+bool previousSlotStatus[numSlots];
+String slotIds[numSlots] = {"slot1", "slot2", "slot3", "slot4"}; // Corresponding IDs for Firebase
+
 MFRC522 rfid(SS_PIN, RST_PIN);
 Servo myServo;
 LiquidCrystal_I2C lcd(0x27, 16, 2); // Common I2C address, could also be 0x3F
 
 bool isOpen = false;
 unsigned long openTime = 0;
-bool ultrasonicDetectedEntry = false;       // Renamed for clarity
-unsigned long ultrasonicStartTimeEntry = 0; // Renamed for clarity
+bool ultrasonicDetectedEntry = false;
+unsigned long ultrasonicStartTimeEntry = 0;
 
 void setup()
 {
@@ -60,6 +68,16 @@ void setup()
     pinMode(ECHO_PIN, INPUT);
     pinMode(TRIG_PIN_OUT, OUTPUT);
     pinMode(ECHO_PIN_OUT, INPUT);
+
+    // Initialize slot sensor pins and initial status
+    for (int i = 0; i < numSlots; i++)
+    {
+        pinMode(slotSensorPins[i], INPUT_PULLUP);               // Assuming TTP223 output is HIGH when touched, LOW otherwise. Use INPUT_PULLUP if it's active LOW. Adjust if needed.
+        previousSlotStatus[i] = digitalRead(slotSensorPins[i]); // Read initial state
+        currentSlotStatus[i] = previousSlotStatus[i];
+        // Optionally, update Firebase with initial status here if needed
+        // updateSlotStatusFirebase(slotIds[i], currentSlotStatus[i]);
+    }
 
     // Connect to WiFi
     WiFi.begin(ssid, password);
@@ -101,18 +119,38 @@ void setup()
         lcd.print("WiFi Gagal");
         lcd.setCursor(0, 1);
         lcd.print("Cek Koneksi");
-        // Potentially loop here or implement other error handling
     }
 }
 
 void loop()
 {
-    // ===== Touch Sensor (Car Presence for Entry) =====
+    // ===== Slot Sensor Detection =====
+    for (int i = 0; i < numSlots; i++)
+    {
+        // Assuming TTP223 gives HIGH when car is present (slot occupied)
+        // and LOW when car is not present (slot empty).
+        // Adjust logic if your sensor behaves differently (e.g., active LOW).
+        // If using INPUT_PULLUP and sensor pulls LOW on detection, then occupied is LOW.
+        bool occupied = (digitalRead(slotSensorPins[i]) == HIGH); // Change to LOW if active-low with pullup
+
+        currentSlotStatus[i] = occupied;
+
+        if (currentSlotStatus[i] != previousSlotStatus[i])
+        {
+            Serial.print("Slot ");
+            Serial.print(slotIds[i]);
+            Serial.print(" status berubah menjadi: ");
+            Serial.println(currentSlotStatus[i] ? "TERISI" : "KOSONG");
+            updateSlotStatusFirebase(slotIds[i], currentSlotStatus[i]);
+            previousSlotStatus[i] = currentSlotStatus[i];
+        }
+    }
+
+    // ===== Touch Sensor (Car Presence for Entry Gate) =====
     if (digitalRead(TOUCH_PIN) == HIGH)
     {
-        Serial.println("Touch detected: Car ready for entry");
-        // Potentially add LCD message or other logic
-        delay(200); // Debounce or short delay
+        Serial.println("Touch detected: Car ready for entry gate");
+        delay(200);
     }
 
     // ===== RFID Detection =====
@@ -124,11 +162,11 @@ void loop()
         lcd.setCursor(0, 0);
         lcd.print("Kartu Terdeteksi");
         lcd.setCursor(0, 1);
-        lcd.print(uid.substring(0, 16)); // Display part of UID if too long
+        lcd.print(uid.substring(0, 16));
 
         if (!isOpen)
         {
-            bukaServo("rfid_entry", uid); // More specific trigger
+            bukaServo("rfid_entry", uid);
         }
 
         rfid.PICC_HaltA();
@@ -137,52 +175,45 @@ void loop()
 
     // ===== Ultrasonic Entry Detection =====
     float distanceEntry = jarakMasuk();
-    Serial.print("Jarak Masuk: ");
-    Serial.println(distanceEntry);
+    // Serial.print("Jarak Masuk: "); Serial.println(distanceEntry); // Uncomment for debugging
     if (distanceEntry >= 2.0 && distanceEntry <= 15.0)
-    { // Adjusted range for more reliable detection
+    {
         if (!ultrasonicDetectedEntry)
         {
             ultrasonicDetectedEntry = true;
             ultrasonicStartTimeEntry = millis();
-            Serial.println("Objek terdeteksi di jalur masuk.");
+            Serial.println("Objek terdeteksi di jalur masuk (ultrasonic).");
         }
         else if ((millis() - ultrasonicStartTimeEntry >= 2000) && !isOpen)
-        { // Wait for 2 seconds
+        {
             Serial.println("Deteksi masuk valid (ultrasonic)");
-            bukaServo("ultrasonic_entry", ""); // No UID for ultrasonic trigger
-            ultrasonicDetectedEntry = false;   // Reset after triggering
+            bukaServo("ultrasonic_entry", "");
+            ultrasonicDetectedEntry = false;
         }
     }
     else
     {
         if (ultrasonicDetectedEntry && (millis() - ultrasonicStartTimeEntry >= 5000))
-        { // Reset if object gone for 5s
+        {
             ultrasonicDetectedEntry = false;
             Serial.println("Objek hilang dari jalur masuk (timeout).");
-        }
-        else if (!ultrasonicDetectedEntry)
-        {
-            // Object not in range, do nothing or reset timer if it was just brief
         }
     }
 
     // ===== Ultrasonic Exit Detection =====
     float distanceExit = jarakKeluar();
-    Serial.print("Jarak Keluar: ");
-    Serial.println(distanceExit);
+    // Serial.print("Jarak Keluar: "); Serial.println(distanceExit); // Uncomment for debugging
     if (distanceExit >= 2.0 && distanceExit <= 15.0 && !isOpen)
-    { // Adjusted range
+    {
         Serial.println("Mobil keluar terdeteksi (ultrasonic)");
-        bukaServo("ultrasonic_exit", ""); // No UID for ultrasonic trigger
-        // Add a delay or condition to prevent immediate re-triggering if needed
-        delay(3000); // Wait 3 seconds before checking again to avoid re-trigger if car moves slowly
+        bukaServo("ultrasonic_exit", "");
+        delay(3000);
     }
 
     // ===== Automatic Servo Close =====
     if (isOpen && (millis() - openTime >= 7000))
-    {                     // Close after 7 seconds
-        myServo.write(0); // Close gate
+    {
+        myServo.write(0);
         isOpen = false;
         Serial.println("Servo ditutup kembali (otomatis)");
         lcd.clear();
@@ -193,13 +224,13 @@ void loop()
         lcd.print("Siap Digunakan");
     }
 
-    delay(100); // Shorter loop delay for responsiveness
+    delay(100);
 }
 
-// ===== Function to open servo and send data to server =====
+// ===== Function to open servo and send gate event to server =====
 void bukaServo(String triggerSource, String uid)
 {
-    myServo.write(90); // Open gate
+    myServo.write(90);
     isOpen = true;
     openTime = millis();
     Serial.print("Servo terbuka oleh: ");
@@ -213,26 +244,26 @@ void bukaServo(String triggerSource, String uid)
         lcd.print(uid.substring(0, 16));
     }
 
-    // Send status to Firebase Realtime Database
     if (WiFi.status() == WL_CONNECTED)
     {
         HTTPClient http;
-        http.begin(serverUrl); // serverUrl already includes the .json path
+        String fullServerUrl = "https://" + String(firebaseHost) + firebaseGateEventsPath;
+        http.begin(fullServerUrl);
         http.addHeader("Content-Type", "application/json");
 
-        StaticJsonDocument<256> doc; // Increased size slightly just in case, 200 should be enough
-        doc["gateId"] = "gate1";     // You can make this dynamic if you have multiple gates
+        StaticJsonDocument<256> doc;
+        doc["gateId"] = "gate1";
         doc["trigger"] = triggerSource;
         doc["status"] = "open";
         if (!uid.isEmpty())
         {
             doc["uid"] = uid;
         }
-        doc["timestamp"] = millis(); // Add a simple timestamp
+        doc["timestamp"] = millis();
 
         String jsonData;
         serializeJson(doc, jsonData);
-        Serial.print("Mengirim JSON: ");
+        Serial.print("Mengirim JSON (gate event): ");
         Serial.println(jsonData);
 
         int httpCode = http.POST(jsonData);
@@ -240,27 +271,69 @@ void bukaServo(String triggerSource, String uid)
         if (httpCode > 0)
         {
             String response = http.getString();
-            Serial.print("Server response code: ");
+            Serial.print("Server response code (gate event): ");
             Serial.println(httpCode);
-            Serial.print("Server response: ");
+            Serial.print("Server response (gate event): ");
             Serial.println(response);
-            // You might want to parse the response if Firebase sends back useful info (e.g., the name of the new node)
         }
         else
         {
-            Serial.print("Gagal kirim ke server, HTTP code: ");
+            Serial.print("Gagal kirim ke server (gate event), HTTP code: ");
             Serial.println(httpCode);
             Serial.print("Error: ");
             Serial.println(http.errorToString(httpCode));
         }
-
         http.end();
     }
     else
     {
-        Serial.println("WiFi tidak terhubung. Data tidak dikirim.");
+        Serial.println("WiFi tidak terhubung. Data (gate event) tidak dikirim.");
         lcd.setCursor(0, 1);
         lcd.print("WiFi Offline");
+    }
+}
+
+// ===== Function to update slot status on Firebase =====
+void updateSlotStatusFirebase(String slotId, bool isOccupied)
+{
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        HTTPClient http;
+        // Construct URL: https://<firebaseHost>/parking_slots/<slotId>.json
+        String url = "https://" + String(firebaseHost) + firebaseParkingSlotsPath + slotId + ".json";
+        http.begin(url);
+        http.addHeader("Content-Type", "application/json"); // Though for boolean, Firebase might not strictly need it for PUT
+
+        String payload = isOccupied ? "true" : "false";
+        Serial.print("Mengirim status slot: ");
+        Serial.print(slotId);
+        Serial.print(" = ");
+        Serial.println(payload);
+        Serial.print("URL: ");
+        Serial.println(url);
+
+        int httpCode = http.PUT(payload); // Send boolean as string
+
+        if (httpCode > 0)
+        {
+            String response = http.getString();
+            Serial.print("Server response code (slot update): ");
+            Serial.println(httpCode);
+            Serial.print("Server response (slot update): ");
+            Serial.println(response);
+        }
+        else
+        {
+            Serial.print("Gagal update status slot ke server, HTTP code: ");
+            Serial.println(httpCode);
+            Serial.print("Error: ");
+            Serial.println(http.errorToString(httpCode));
+        }
+        http.end();
+    }
+    else
+    {
+        Serial.println("WiFi tidak terhubung. Status slot tidak dikirim.");
     }
 }
 
@@ -273,10 +346,10 @@ float jarakMasuk()
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
 
-    long duration = pulseIn(ECHO_PIN, HIGH, 23200); // Timeout approx 400cm (0.034 * 23200 / 2)
-    float distance = duration * 0.0343 / 2;         // Speed of sound is approx 343 m/s
+    long duration = pulseIn(ECHO_PIN, HIGH, 23200);
+    float distance = duration * 0.0343 / 2;
     if (duration == 0)
-        return 999; // Indicate timeout or no echo
+        return 999;
     return distance;
 }
 
@@ -292,7 +365,7 @@ float jarakKeluar()
     long duration_out = pulseIn(ECHO_PIN_OUT, HIGH, 23200);
     float distance_out = duration_out * 0.0343 / 2;
     if (duration_out == 0)
-        return 999; // Indicate timeout or no echo
+        return 999;
     return distance_out;
 }
 
@@ -305,9 +378,9 @@ String getUID()
         uidString += (rfid.uid.uidByte[i] < 0x10 ? "0" : "");
         uidString += String(rfid.uid.uidByte[i], HEX);
         if (i < rfid.uid.size - 1)
-            uidString += ":"; // Add separator for readability
+            uidString += ":";
     }
-    uidString.toUpperCase(); // Standard format for UIDs
+    uidString.toUpperCase();
     Serial.print("UID: ");
     Serial.println(uidString);
     return uidString;
