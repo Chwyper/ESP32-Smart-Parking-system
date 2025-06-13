@@ -1,151 +1,198 @@
 #include <ESP32Servo.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
+// ==== Pin Konfigurasi ====
 // RFID
 #define RST_PIN     22
 #define SS_PIN      21
 
-// Servo
+// Servo dan Touch
 #define SERVO_PIN   2
 #define TOUCH_PIN   14
-#define TOUCH_PIN2  27 
+#define TOUCH_PIN2  27
+#define TOUCH_PIN3  33
+#define TOUCH_PIN4  32
 
-// Ultrasonic
+// Ultrasonik
 #define TRIG_PIN        5
 #define ECHO_PIN        17
-#define TRIG_PIN_OUT   12
-#define ECHO_PIN_OUT   13
+#define TRIG_PIN_OUT    12
+#define ECHO_PIN_OUT    13
 
+// I2C LCD - custom SDA & SCL
+#define SDA_LCD 25
+#define SCL_LCD 26
+
+// ==== Objek ====
 MFRC522 rfid(SS_PIN, RST_PIN);
 Servo myServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // Alamat umum 0x27
 
+// ==== Variabel ====
 bool isOpen = false;
 unsigned long openTime = 0;
-
-// Untuk deteksi ultrasonik masuk
 bool ultrasonicDetected = false;
 unsigned long ultrasonicStartTime = 0;
+bool slotTerisi[4] = {false, false, false, false};
 
+// ==== Setup ====
 void setup() {
   Serial.begin(115200);
   SPI.begin();
   rfid.PCD_Init();
-  Serial.println("Tempelkan kartu RFID...");
+
+  Wire.begin(SDA_LCD, SCL_LCD);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Sistem Parkir");
+  lcd.setCursor(0, 1);
+  lcd.print("Smart Dimulai");
+  delay(2000);
+  lcd.clear();
 
   myServo.attach(SERVO_PIN);
   myServo.write(0); // posisi awal tertutup
 
   pinMode(TOUCH_PIN, INPUT);
+  pinMode(TOUCH_PIN2, INPUT);
+  pinMode(TOUCH_PIN3, INPUT);
+  pinMode(TOUCH_PIN4, INPUT);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(TRIG_PIN_OUT, OUTPUT);
   pinMode(ECHO_PIN_OUT, INPUT);
+
+  Serial.println("Sistem Siap. Tempelkan kartu RFID...");
 }
 
+// ==== Loop Utama ====
 void loop() {
-  // ===== Touch Sensor =====
-  if (digitalRead(TOUCH_PIN) == HIGH) {
-    Serial.println("Touch detected: Slot 1 isi");
-    delay(200); // debounce
-  }
+  // Update status slot
+  slotTerisi[0] = digitalRead(TOUCH_PIN) == HIGH;
+  slotTerisi[1] = digitalRead(TOUCH_PIN2) == HIGH;
+  slotTerisi[2] = digitalRead(TOUCH_PIN3) == HIGH;
+  slotTerisi[3] = digitalRead(TOUCH_PIN4) == HIGH;
 
-  if (digitalRead(TOUCH_PIN2) == HIGH) {
-    Serial.println("Touch detected: Slot 2 isi");
-    delay(200); // debounce
-  }
-
-  // ===== RFID Deteksi =====
+  // === Deteksi RFID ===
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     Serial.println("Kartu RFID terdeteksi!");
     printUIDToSerial();
 
-    if (!isOpen) {
+    int slot = cariSlotKosong();
+    if (slot != -1 && !isOpen) {
       bukaServo();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Masuk: Slot ");
+      lcd.print(slot + 1);
+      lcd.setCursor(0, 1);
+      lcd.print("Silakan Parkir");
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Parkiran Penuh");
+      lcd.setCursor(0, 1);
+      lcd.print("Tunggu Kosong");
     }
 
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
   }
 
-  // ===== Ultrasonik Masuk =====
+  // === Ultrasonik Masuk ===
   float distance = jarakmasuk();
-  Serial.print("Jarak masuk: ");
-  Serial.println(distance);  // Debug distance
-  
   if (distance >= 6.0 && distance <= 9.0) {
     if (!ultrasonicDetected) {
       ultrasonicDetected = true;
       ultrasonicStartTime = millis();
-      Serial.println("Deteksi awal ultrasonik");
     }
-    
-    // Cek jika sudah 3 detik berturut-turut
+
     if ((millis() - ultrasonicStartTime >= 3000) && !isOpen) {
-      Serial.println("Deteksi masuk valid, membuka gerbang...");
-      bukaServo();
+      int slot = cariSlotKosong();
+      if (slot != -1) {
+        bukaServo();
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Sensor: Slot ");
+        lcd.print(slot + 1);
+        lcd.setCursor(0, 1);
+        lcd.print("Silakan Masuk");
+      } else {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Parkiran Penuh");
+        lcd.setCursor(0, 1);
+        lcd.print("Tunggu Kosong");
+      }
       ultrasonicDetected = false;
     }
   } else {
     ultrasonicDetected = false;
-    Serial.println("Objek keluar jangkauan");
   }
 
-  // ===== Ultrasonik Keluar =====
+  // === Ultrasonik Keluar ===
   float distance_out = jarakkeluar();
-  Serial.print("Jarak keluar: ");
-  Serial.println(distance_out);
-  
-  if (distance_out >= 2.0 &&  distance_out <= 4.5 && !isOpen) {
-    Serial.println("Mobil keluar, membuka gerbang...");
+  if (distance_out >= 2.0 && distance_out <= 4.5 && !isOpen) {
     bukaServo();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Terima Kasih");
+    lcd.setCursor(0, 1);
+    lcd.print("Hati-hati!");
   }
 
-  // ===== Tutup otomatis servo setelah 10 detik =====
+  // === Tutup Otomatis ===
   if (isOpen && (millis() - openTime >= 10000)) {
     myServo.write(0);
     isOpen = false;
-    Serial.println("Servo ditutup kembali");
+    Serial.println("Servo ditutup");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Gerbang Ditutup");
   }
 
-  delay(500);
+  delay(300);
 }
 
-// ===== Fungsi buka servo =====
+// ==== Fungsi Tambahan ====
 void bukaServo() {
-  myServo.write(90);  // Buka
+  myServo.write(90);
   isOpen = true;
   openTime = millis();
-  Serial.println("Servo terbuka");
+  Serial.println("Gerbang terbuka");
 }
 
-// ===== Fungsi jarak masuk =====
 float jarakmasuk() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH, 30001);
-  float distance = duration * 0.034 / 2;
-  return distance;
+  long dur = pulseIn(ECHO_PIN, HIGH, 30000);
+  return dur * 0.034 / 2;
 }
 
-// ===== Fungsi jarak keluar =====
 float jarakkeluar() {
   digitalWrite(TRIG_PIN_OUT, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN_OUT, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN_OUT, LOW);
-
-  long duration_out = pulseIn(ECHO_PIN_OUT, HIGH, 30000);
-  float distance_out = duration_out * 0.034 / 2;
-  return distance_out;
+  long dur = pulseIn(ECHO_PIN_OUT, HIGH, 30000);
+  return dur * 0.034 / 2;
 }
 
-// ===== Fungsi tampilkan UID ke Serial =====
+int cariSlotKosong() {
+  for (int i = 0; i < 4; i++) {
+    if (!slotTerisi[i]) return i;
+  }
+  return -1;
+}
+
 void printUIDToSerial() {
   String uidString = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
@@ -154,7 +201,6 @@ void printUIDToSerial() {
     if (i < rfid.uid.size - 1) uidString += ":";
   }
   uidString.toUpperCase();
-
   Serial.print("UID: ");
   Serial.println(uidString);
 }
